@@ -143,6 +143,7 @@ public:
     const uint32_t num_max_shared_m_blocks = config.num_shared_experts > 0 ? ceil_div(config.num_max_tokens_per_rank, BLOCK_M) : 0;
     // 每阶段保留 shared 最大块数与 routed 最大块数；运行时 routed slot 从实际 shared 块数之后开始。
     const uint32_t num_progress_counters_per_stage = num_max_shared_m_blocks + get_num_max_m_blocks();
+    // metadata 行数 Bmax*256；l1/l2/output 的 payload 只占 Bring*256，因此 ring 降低激活空间但不压缩 metadata。
     const uint64_t num_full_pool_rows = get_num_max_m_blocks() * BLOCK_M;
 
     // Size from the registered limit, not active T
@@ -233,14 +234,18 @@ public:
     // 返回区为全量 [topk-slot][Tmax][hidden]，不随中间激活 ring 回绕。
     // 共享专家（如有）合并为额外一个槽；源端读取有效 route 并在 FP32 中求和。
     // One BF16 slot per route, plus one combined shared slot
+    // 这里仍按每 route 全量返回保存：约2B*(topk+shared_slot)*Tmax*H，
+    // 所以不能将“中间激活 ring”误称为整个工作区容量与 T 无关。
     Buffer<bf16_t> combine_input{
         next_offset, static_cast<uint64_t>(config.num_topk + (config.num_shared_experts > 0)) * config.num_max_tokens_per_rank * config.hidden,
         kNumBufferAlignmentBytes};
 
     // Shared Linear2 inputs; Linear1 reads original tokens
+    // 所有 shared expert 在 intermediate 维拼成 num_shared_experts*I，Linear2 沿该 K 维求和到同一 shared 返回槽。
     FP8Buffer shared_l2_acts{next_offset, config.num_shared_experts > 0 ? num_padded_shared_rows : 0, config.shared_intermediate_hidden};
 
     // Producer M-block for each input route; dispatch fills this before publishing readiness
+    // 源 rank 上 [Tmax][topk] 的生产块映射；由远端专家 dispatch 写入，归并侧不得根据随机/置换后的 row 顺序猜测。
     Buffer<uint32_t> route_m_blocks{
         next_offset, static_cast<uint64_t>(config.num_max_tokens_per_rank) * config.num_topk, kNumBufferAlignmentBytes};
 

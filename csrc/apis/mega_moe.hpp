@@ -35,6 +35,7 @@ static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
     DJ_HOST_ASSERT(hidden > 0 and hidden % layout::BLOCK_N == 0);
     DJ_HOST_ASSERT(intermediate_hidden >= 512 and
                    intermediate_hidden % layout::BLOCK_N == 0);
+    // count 低24位与 combine row 低24位都依赖容量界限；限制全rank最坏route数防止 packed 编码溢出。
     DJ_HOST_ASSERT(static_cast<uint64_t>(num_ranks) * num_max_tokens_per_rank * num_topk <
                    layout::kCountArrivalBit);
     return layout::Workspace{{num_ranks, num_experts, num_shared_experts, num_max_tokens_per_rank,
@@ -61,6 +62,7 @@ struct SymmBuffer {
     }
 };
 
+// from_blob 仅建立外部内存视图，不拥有 allocation；调用方必须保留根 SymmBuffer，不能让输入 view 独立延长 lease 生命周期。
 static torch::Tensor slice_buffer(const torch::Tensor& buffer, uint64_t offset,
                                   torch::IntArrayRef shape, torch::ScalarType dtype) {
     DJ_HOST_ASSERT(buffer.dim() == 1 and buffer.scalar_type() == torch::kInt8 and buffer.is_contiguous());
@@ -189,6 +191,7 @@ static void fp8_fp4_mega_moe(
                                   hidden / layout::BLOCK_N, workspace.config.shared_intermediate_hidden);
     }
     // NOTES: All weights/SFs must be on the current device, like y and sym_buffer
+    // launch 的 clamp 先舍入为 BF16 再传给 kernel，Vector 激活使用同一阈值；默认无穷表示不截断。
     const auto activation_clamp = activation_clamp_opt.value_or(std::numeric_limits<float>::infinity());
     DJ_HOST_ASSERT(activation_clamp >= 0);
     launch_mega_moe({

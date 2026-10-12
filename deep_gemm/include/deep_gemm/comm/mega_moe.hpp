@@ -140,6 +140,8 @@ void build_dispatch_metadata(__gm__ uint8_t* buffer, __gm__ const int64_t* topk_
 
     const auto grid_sync_ptr = workspace.sync.grid_sync_count.get_ptr(buffer);
     const auto expert_count = workspace.metadata.worker_expert_count.get_ptr(buffer);
+    // 三个表的生命周期：worker_expert_count 是跨 worker 汇总 scratch；total_expert_count 决定发送长度；
+    // staged_token_topk_idx 保存索引，接收端 src_token_metadata 则是最终的索引/权重二元组。
     const auto total_expert_count = workspace.metadata.total_expert_count.get_ptr(buffer);
     const auto staged_token_topk_idx = workspace.metadata.staged_token_topk_idx.get_ptr(buffer);
     // Metadata owns this UB scratch until the VF completes
@@ -159,6 +161,8 @@ void build_dispatch_metadata(__gm__ uint8_t* buffer, __gm__ const int64_t* topk_
     // worker_begin/batch_stride 同时用于计数与索引写入，确保两次扫描覆盖完全一致的 route。
     const uint32_t worker_stride = not kOverlapReduce ? layout::kNumDispatchThreads :
         (num_token_topk + kNumThreadsPerRound - 1) / kNumThreadsPerRound * layout::kNumDispatchThreads;
+    // overlap 时 token_topk_end 可能截在该 worker 的连续区间末；普通模式则一直扫描到 num_token_topk。
+    // 这组边界贯穿两次 route 扫描，不能只改其中一次的分核规则。
     const uint32_t worker_begin = worker_idx * worker_stride;
     const uint32_t batch_stride = (kOverlapReduce ? 1 : num_workers) * layout::kNumDispatchThreads;
     const uint32_t worker_end = worker_begin + worker_stride;
@@ -180,6 +184,7 @@ void build_dispatch_metadata(__gm__ uint8_t* buffer, __gm__ const int64_t* topk_
     // Save counts, then reuse UB counters as write offsets
     for (uint32_t expert_idx = thread_idx; expert_idx < config.num_experts; expert_idx += layout::kNumDispatchThreads)
         expert_count[worker_idx * config.num_experts + expert_idx] = expert_token_count[expert_idx];
+    // 屏障0：所有 worker 的专家计数已落 GM，才可读前序 worker 数计算 exclusive prefix。
     grid_sync<0>(grid_sync_ptr, rank_idx, worker_idx, num_workers);
 
     for (uint32_t expert_idx = thread_idx; expert_idx < config.num_experts; expert_idx += layout::kNumDispatchThreads) {
@@ -211,6 +216,7 @@ void build_dispatch_metadata(__gm__ uint8_t* buffer, __gm__ const int64_t* topk_
         if (kOverlapReduce and batch_base + batch_stride < token_topk_end)
             asc_syncthreads();
     }
+    // 屏障1：total count 与所有 staged route 都已写好；后面 warp 可能发送其他 worker 写入的 slot。
     grid_sync<1>(grid_sync_ptr + 1, rank_idx, worker_idx, num_workers);
 
     // Distribute expert ranges across warps
@@ -237,9 +243,13 @@ void build_dispatch_metadata(__gm__ uint8_t* buffer, __gm__ const int64_t* topk_
             // 按 uint32 原样搬运 float 位模式，高位不是数值转换；接收端再将这些位写入 float 存储。
             // 索引和权重合成一次 64-bit 写，避免 dispatch 时逐 route 远端读取权重。
             const uint32_t weight_bits = *workspace.input.topk_weights.template get_ptr<uint32_t>(buffer, token_topk_idx);
+            // 例 token=7、topk=6、槽j=2，低位保存44；接收端 44/6=7、44%6=2。
+            // 高位保留 weight 的 float 位模式，即使本 token 的其他槽也命中该卡，仍再发送独立 metadata。
             remote_metadata[slot_idx] = (static_cast<uint64_t>(weight_bits) << 32) | token_topk_idx;
         }
     }
+    // 屏障2：所有 metadata 远端写完成发布后，worker0 才向专家 owner 发 count；
+    // 接收方以 arrival 为就绪证明，不能出现 count 先发布但 metadata 仍在写的顺序。
     grid_sync<2>(grid_sync_ptr + 2, rank_idx, worker_idx, num_workers);
 
     // 发布顺序是 metadata 数据 -> grid_sync/threadfence -> 每源 count -> arrival 原子计数。
@@ -281,6 +291,7 @@ __aicore__ __forceinline__ uint32_t wait_dispatch_metadata(__gm__ uint8_t* buffe
     const auto num_m_blocks_certificate = workspace.metadata.num_m_blocks_certificate.get_ptr(buffer);
 
     // Wait for source counts and sum local M-blocks
+    // 此函数计算整个 rank 的静态调度边界，不做 payload 传输；count 完整后才允许专家游标读取。
     uint32_t num_contributed_m_blocks = 0;
     for (uint32_t expert_idx = core_idx; expert_idx < config.num_experts / config.num_ranks; expert_idx += kNumAICores) {
         const auto count_ptr = workspace.metadata.expert_recv_count_sum.get_ptr(buffer, expert_idx);

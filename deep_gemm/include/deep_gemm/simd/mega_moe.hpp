@@ -72,6 +72,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
     constexpr uint32_t kNumPairs = kNumRowsPerIteration * kNumPairsPerRow;
     static_assert(layout::BLOCK_N == 256);
 
+    // group_mask 覆盖每个64通道向量的前32元素，pair_mask 覆盖全64；后半通道先 gather 到前32再独立归约。
     const vector_bool group_mask_b32 = asc_create_mask_b32(PAT_VL32);
     const vector_bool pair_mask_b32 = asc_create_mask_b32(PAT_VL64);
     vector_bfloat16_t zero_bf16;
@@ -89,6 +90,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
     auto up_ptr = input + layout::BLOCK_N / 2;
     auto output_ptr = reinterpret_cast<__ubuf__ uint8_t*>(output);
 
+    // 两行批处理，奇数尾行仍从已分配的 padding 行读；调用方 GM store 只提交 stage_valid_m，不写 padding。
     for (uint32_t m_idx = 0; m_idx < valid_m; m_idx += kNumRowsPerIteration) {
         // Load gate/up as FP32
         vector_float gate[kNumPairs], up[kNumPairs], value[kNumPairs];
@@ -137,6 +139,8 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
         #pragma unroll
         for (uint32_t pair_idx = 0; pair_idx < kNumPairs; ++ pair_idx) {
             const uint32_t m_offset = pair_idx / kNumPairsPerRow;
+            // pair_idx / 2 选本次两行中的行，pair_idx % 2 选该行的前/后64激活列；
+            // 因此 scale row/column 的写入位置与压紧 FP8 列顺序完全对应。
             const uint32_t sf_pair_idx = pair_idx % kNumPairsPerRow;
             vector_uint32_t bits[2];
             asc_abs(reinterpret_cast<vector_float&>(bits[0]), value[pair_idx], pair_mask_b32);
@@ -149,6 +153,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
             }
 
             // Round amax / 448 up to a power of two
+            // 把两个32通道组的 amax 广播拼回同一64通道向量，各半使用自己的量化scale，而非整个128列共用scale。
             asc_select(bits[0], bits[0], bits[1], group_mask_b32);
             // 用最小 amax 避免零输入产生过小尺度；对浮点指数位操作，将 amax/448 向上取 2 的幂。
             // scale 是 2^s，inv_scale_bits 构造 2^-s，不通过逐元素除法计算逆尺度。
@@ -159,6 +164,8 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
                            reinterpret_cast<vector_int32_t&>(bits[0]), -0x04000000, pair_mask_b32);  // Subtract 8 from exponent
             asc_min_scalar(bits[0], bits[0], 0x7f000000u, pair_mask_b32);
             vector_uint32_t inv_scale_bits;
+            // scale 保留纯指数位，对 FP32 exponent 做 254-exponent 的位算术构造其倒数，再乘加权激活。
+            // 后面右移23位取 scale exponent，存为 E8M0，不保存 FP32 尾数。
             asc_sub(inv_scale_bits, inv_scale_bias, bits[0], pair_mask_b32);
             asc_mul(value[pair_idx], value[pair_idx], reinterpret_cast<vector_float&>(inv_scale_bits), pair_mask_b32);
 
@@ -168,6 +175,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
             asc_float2e4m3_rn_sat(value_fp8, value[pair_idx], pair_mask_b32, ASC_DISPERSE_FIRST_QUARTER);
             asc_storealign_pack_quarter(reinterpret_cast<__ubuf__ uint32_t*>(output_ptr),
                                         reinterpret_cast<vector_uint32_t&>(value_fp8), pair_mask_b32);
+            // 当前64列输出占64字节；每次 pair 都推进，因此两个pair组成当前行128字节FP8，之后才进入下一行。
             output_ptr += MX_SF_DIVISOR;
 
             asc_shiftright_scalar(bits[0], bits[0], 23, pair_mask_b32);

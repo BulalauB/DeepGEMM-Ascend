@@ -40,6 +40,9 @@ struct ExpertCursor {
         const uint32_t num_expert_m_blocks = ceil_div(num_expert_tokens, layout::BLOCK_M);
         // pool_block_end - num_expert_m_blocks 是当前专家的起始块号；由此转成专家内块号。
         const uint32_t expert_m_block_idx = pool_block_idx + num_expert_m_blocks - pool_block_end;
+        // 具体分块例：M=300，FRAC_MN=16，共 19 个行组、2 个 M-block。
+        // 前块拿 10 组=160 行，后块拿 9 组但按真实剩余截为 140 行；不是简单 256+44。
+        // expert_m_begin 是专家内紧凑行号，而实际 GM 块仍各占 256 行，两者不可混用作 stride。
         const uint32_t num_m_groups = ceil_div(num_expert_tokens, FRAC_MN);
         const uint32_t num_groups_per_block = num_m_groups / num_expert_m_blocks;
         // 行组不能均分时，前 remainder 个块各多分一个 FRAC_MN 组；最后用真实行数截断 padding。
@@ -117,6 +120,10 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
             const uint32_t required_linear1_task_end =
                 ceil_div(min(state.l2_task_base + kNumAICores, num_routed_tasks[1]), kNumLinear2NBlocks) *
                 kNumLinear1NBlocks;
+            // 例 C=32、GMM1 每块24任务、GMM2 每块28任务：GMM2 base=0 时下一 wave 覆盖块0/1，
+            // required GMM1 end=ceil(32/28)*24=48；判定界限再加32成为80，GMM1 base 按0/32/64推进。
+            // 所以启动阶段先分配3个 GMM1 wave，再选 GMM2；“一 wave 前瞻”是任务数预算，并非恰好一个 M-block。
+            // 该选择只分配任务，GMM2 真正读取仍要等覆盖块全部 GMM1 epilogue 的 I/128 完成计数。
             is_linear1 = state.l1_task_base < required_linear1_task_end + kNumAICores;
         }
 
@@ -126,6 +133,8 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
         // 选择层后，只推进该层游标；AIC/AIV0/AIV1 使用相同函数重放相同 routed 次序。
         const uint32_t task_idx = task_base + core_idx;
         task_base += kNumAICores;
+        // 尾 wave 可能某核 task_idx 越界，此核在 while 中继续推进到另一层/下一 wave；
+        // 各角色须用相同 core_idx 重放，不能自行跳过合法任务，否则权重与 FIX 输出的消费次序会错位。
         if (task_idx < num_routed_tasks[layer_idx]) {
             block_phase = is_linear1 ? BlockPhase::kLinear1 : BlockPhase::kLinear2;
             return task_idx;

@@ -8,6 +8,7 @@ namespace deep_gemm::mega_moe::sched {
 // kNone means no current task
 enum class BlockPhase : uint32_t {kNone, kLinear1, kLinear2, kSharedLinear1, kSharedLinear2};
 
+// 四个游标分别记录 shared/routed 两层下一批任务的起点；不是同一公共游标。
 struct LinearTaskState {
     uint32_t shared_l1_task_base = 0;
     uint32_t l1_task_base = 0;
@@ -15,6 +16,8 @@ struct LinearTaskState {
     uint32_t shared_l2_task_base = 0;
 };
 
+// 调度只决定任务次序和归属，输入是否可消费由调用方的完成计数判断。
+// AIC、AIV0 权重生产者和 AIV1 epilogue 重放同一 routed 序列，避免任务/权重错配。
 // Map logical M-blocks to nonempty local experts
 template <const auto& workspace>
 struct ExpertCursor {
@@ -25,16 +28,21 @@ struct ExpertCursor {
     __aicore__ void next_expert(uint32_t num_tokens) {
         ++ local_expert_idx;
         num_expert_tokens = num_tokens;
+        // 专家块在逻辑 pool 内连续拼接；零 token 专家不移动 end，advance_to 会继续跳过它。
         pool_block_end += ceil_div(num_tokens, layout::BLOCK_M);
     }
 
+    // 将专家行数按 FRAC_MN 行组均分到 ceil(M/256) 个块，减少末块过小的浪费。
+    // 实际有效行数可小于 256，但 GM 每个逻辑块始终保留 256 行 stride。
     // Balance FRAC_MN groups; expert M is compact, pool blocks keep the BLOCK_M stride
     // Return valid_m and write the expert-relative M start
     __aicore__ uint32_t get_m_block_range(uint32_t pool_block_idx, uint32_t& expert_m_begin) const {
         const uint32_t num_expert_m_blocks = ceil_div(num_expert_tokens, layout::BLOCK_M);
+        // pool_block_end - num_expert_m_blocks 是当前专家的起始块号；由此转成专家内块号。
         const uint32_t expert_m_block_idx = pool_block_idx + num_expert_m_blocks - pool_block_end;
         const uint32_t num_m_groups = ceil_div(num_expert_tokens, FRAC_MN);
         const uint32_t num_groups_per_block = num_m_groups / num_expert_m_blocks;
+        // 行组不能均分时，前 remainder 个块各多分一个 FRAC_MN 组；最后用真实行数截断 padding。
         const uint32_t num_larger_m_blocks = num_m_groups % num_expert_m_blocks;
 
         expert_m_begin = (expert_m_block_idx * num_groups_per_block + min(expert_m_block_idx, num_larger_m_blocks)) * FRAC_MN;
@@ -44,6 +52,7 @@ struct ExpertCursor {
 
     // Advance the expert cursor and return valid rows
     __aicore__ uint32_t advance_to(__gm__ uint8_t* buffer, uint32_t pool_block_idx) {
+        // 计数来自已汇总的 expert_recv_count_sum，只取低 24 位；跳过空专家直到逻辑块落入区间。
         while (pool_block_idx >= pool_block_end)
             next_expert(asc_load_dev(workspace.metadata.expert_recv_count_sum.get_ptr(buffer, local_expert_idx + 1)) &
                         layout::kCountValueMask);
@@ -60,6 +69,7 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
                                             LinearTaskState& state, uint32_t core_idx,
                                             BlockPhase& block_phase, bool metadata_ready = true) {
     constexpr auto& config = workspace.config;
+    // GMM1 每任务投影 N256，但激活输出 N128，因此 task 数为 I/128；GMM2 每任务输出 N256。
     constexpr uint32_t kNumLinear1NBlocks = config.intermediate_hidden / (layout::BLOCK_N / 2);
     constexpr uint32_t kNumLinear2NBlocks = config.hidden / layout::BLOCK_N;
     constexpr uint32_t kNumSharedLinear1NBlocks = config.shared_intermediate_hidden / (layout::BLOCK_N / 2);
@@ -76,6 +86,7 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
                 continue;
 
             // Advance past waves with no task for this core
+            // 本核取 wave 起点加 core_idx；所有核游标统一前进 32，尾 wave 无任务核也跳过该 wave。
             const uint32_t task_idx = task_base + core_idx;
             task_base += kNumAICores;
             if (task_idx < num_tasks) {
@@ -86,17 +97,23 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
     }
 
     // Routed tasks require metadata
+    // kNone 在 metadata 尚未到达时只表示暂时无 routed 任务，调用方必须继续等待而非退出。
     if (not metadata_ready) {
         block_phase = BlockPhase::kNone;
         return ~uint32_t{0};
     }
 
+    // wave 指 kNumAICores 个线性 GEMM 任务，不是固定 256 个 token。
+    // 先补齐下一 wave GMM2 所需 M-block 的 GMM1，再多做一 wave GMM1 作为前瞻，
+    // 随后切到 GMM2；两层任务各自推进 task_base，不是跑完全部 GMM1 才执行 GMM2。
     // Prepare the next Linear2 wave with one Linear1 wave of lookahead
     const uint32_t num_routed_tasks[2]{num_total_m_blocks * kNumLinear1NBlocks, num_total_m_blocks * kNumLinear2NBlocks};
 
     while (state.l1_task_base < num_routed_tasks[0] or state.l2_task_base < num_routed_tasks[1]) {
         bool is_linear1 = state.l2_task_base >= num_routed_tasks[1];
         if (not is_linear1 and state.l1_task_base < num_routed_tasks[0]) {
+            // 下一 GMM2 wave 的右开 task 边界 -> ceil_div 得到它覆盖的 M-block 右边界。
+            // 乘 GMM1 的 N-block 数，得到必须完成的 GMM1 task 前缀；再加 32 个任务作一 wave 前瞻。
             const uint32_t required_linear1_task_end =
                 ceil_div(min(state.l2_task_base + kNumAICores, num_routed_tasks[1]), kNumLinear2NBlocks) *
                 kNumLinear1NBlocks;
@@ -105,6 +122,8 @@ __aicore__ inline uint32_t take_linear_task(uint32_t num_shared_tokens, uint32_t
 
         const uint32_t layer_idx = is_linear1 ? 0 : 1;
         auto& task_base = is_linear1 ? state.l1_task_base : state.l2_task_base;
+        // 两层分别保持 task_idx 的 M-major 线性编号：task / Nblocks 是 M-block，task % Nblocks 是 N-block。
+        // 选择层后，只推进该层游标；AIC/AIV0/AIV1 使用相同函数重放相同 routed 次序。
         const uint32_t task_idx = task_base + core_idx;
         task_base += kNumAICores;
         if (task_idx < num_routed_tasks[layer_idx]) {

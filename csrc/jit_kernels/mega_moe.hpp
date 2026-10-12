@@ -41,6 +41,8 @@ static void __instantiate() {{
     const auto kernel = jit->compile("mega_moe", code);
 
     const auto stream = get_current_npu_stream();
+    // 完成计数、已发 GEMM 序号和 metadata_ready 共用连续 progress 区，每次调用整体清零。
+    // memset 与 kernel 在同一 stream 顺序执行；接收 count 的清零和跨 rank 握手由 kernel 负责。
     const auto progress = workspace.progress.blocks.get_ptr(args.buffer);
     DJ_ACL_CHECK(aclrtMemsetAsync(progress, workspace.num_progress_bytes, 0,
                                  workspace.num_progress_bytes, stream));

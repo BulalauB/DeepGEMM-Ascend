@@ -22,6 +22,7 @@ struct SymBuffer {
     template <typename Container>
     explicit SymBuffer(const Container& c, uint32_t rank_idx): base(c[rank_idx]), rank_idx(rank_idx) {
         for (uint32_t i = 0; i < kNumMaxRanks; ++ i)
+            // peer_base - local_base 为 VA 差值；各 rank workspace 布局相同，所以任一区域同 offset 都可平移映射。
             offsets[i] = i < c.size() ? c[i] - base : 0;
     }
 
@@ -36,6 +37,7 @@ struct SymBuffer {
     static constexpr __aicore__ __attribute__((always_inline)) ptr_t map(ptr_t ptr, uint32_t dst_rank_idx, offset_ptr_t offsets) {
         if constexpr (kNumRanks == 1)
             return ptr;
+        // 此处只做地址平移，不执行通信或同步；后续 Scalar/MTE 指令才访问远端已注册内存。
         const uint64_t address = __builtin_bit_cast(uint64_t, ptr) + offsets[dst_rank_idx];
         return __builtin_bit_cast(ptr_t, address);
     }

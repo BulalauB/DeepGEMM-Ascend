@@ -8,6 +8,8 @@
 
 namespace deep_gemm::mega_moe::layout {
 
+// M256 是通信/存储/依赖的逻辑块上限；实际 MAD 可以选择 M128 或 M256。
+// GMM1 的物理 N256 为 gate128 + up128，SwiGLU 后逻辑输出宽度为 128；GMM2 输出 N256。
 // Logical blocks keep the GM stride and task count independent of the MAD shape
 constexpr uint32_t BLOCK_M = 256, BLOCK_N = 256;
 
@@ -23,7 +25,18 @@ constexpr uint32_t kNumDispatchThreads = 512;
 constexpr uint32_t kCountArrivalBit = 1u << 24;
 constexpr uint32_t kCountValueMask = kCountArrivalBit - 1;
 
+// 每个逻辑块的状态链及计数含义：
+// Dispatched：所有 AIV1 搬运核完成（含空 owner）；Linear1Ready：全部 GMM1 N-block 完成量化；
+// Linear2Ready：全部 GMM2 N-block 完成写回；CombineSent：所有 AIV1 完成该块回传。
+// flags 使用不回绕的逻辑块索引，payload 使用 ring 索引，从而区分同槽的不同代数据。
 // Routed progress counts workers or GEMM N blocks
+// routed 完成计数的写者、等待目标和释放对象（C=32，I=intermediate_hidden，H=hidden）：
+//   kDispatched   ：每个 AIV1 每块 +1；AIC 等 C，读取 l1_acts。
+//   kLinear1Ready ：每个完整 GMM1/量化任务 +1；AIC 等 I/128，读取 l2_acts；pull 同时可回收旧 l1_acts。
+//   kLinear2Ready ：每个 GMM2 FIX 完成任务 +1；push 等 H/256，读取 output；epilogue 可回收旧 l2_acts。
+//   kCombineSent  ：每个 AIV1 排空一批回传后，对批中每块 +1；AIC 等 C，回收旧 output。
+// payload 槽 b % ring_blocks 的下一代 b，分别等待以上三种消费者完成中的 b-ring_blocks；
+// progress 的逻辑 b 不取模，本次调用开始统一清零。shared 的特殊计数在 epilogue 中单独处理。
 enum ProgressStage : uint32_t {
     kDispatched,    // Linear1 inputs ready
     kLinear1Ready,  // Quantized Linear2 inputs ready
@@ -53,6 +66,7 @@ struct Buffer {
     uint64_t offset;
 
     constexpr __aicore__ Buffer(uint64_t& next_offset, uint64_t num_elements, uint64_t alignment = kStrideBytes):
+        // 按 alignment 对齐起点，再为固定 stride 的 num_elements 个条目推进偏移；host/device 共用公式。
         offset(aligned(next_offset, alignment)) { next_offset = offset + num_elements * kStrideBytes; }
 
     // entry_idx uses kStrideBytes even when view_t changes
@@ -63,6 +77,7 @@ struct Buffer {
                       "Buffer base must be a pointer or a uint64_t address");
 
         // Preserve the base type through CANN lowering
+        // 地址 = allocation base + 区域 byte offset + entry_idx * 固定 byte stride；view_t 不影响步长。
         const auto address = __builtin_bit_cast(uintptr_t, base) + offset + entry_idx * kStrideBytes;
         return __builtin_bit_cast(__gm__ view_t*, address);
     }
@@ -106,6 +121,7 @@ public:
         int32_t signals[2];
     };
 
+    // data 每元素 1B；sf 每元素 int16，含两个 E8M0 scale，覆盖 64 个通道（每 32 通道一个 scale）。
     struct FP8Buffer {
         Buffer<fp8_t> data;
         Buffer<int16_t> sf;
@@ -117,12 +133,15 @@ public:
 
     Config config;
 
+    // 这里按最坏偏斜预留：每个源 rank 的全部 Tmax*topk route 都可能命中同一专家。
+    // 元数据空间按专家乘该容量；实际发送仅使用有效 count 前缀，不能将预留量当通信量。
     // Reserve one packed index/weight entry per source route.
     const uint32_t num_src_slots_per_expert = config.num_max_tokens_per_rank * config.num_topk;
     const uint64_t num_src_indices = static_cast<uint64_t>(config.num_experts) * num_src_slots_per_expert;
     const uint32_t num_padded_shared_rows = aligned(config.num_max_tokens_per_rank, BLOCK_M);
 
     const uint32_t num_max_shared_m_blocks = config.num_shared_experts > 0 ? ceil_div(config.num_max_tokens_per_rank, BLOCK_M) : 0;
+    // 每阶段保留 shared 最大块数与 routed 最大块数；运行时 routed slot 从实际 shared 块数之后开始。
     const uint32_t num_progress_counters_per_stage = num_max_shared_m_blocks + get_num_max_m_blocks();
     const uint64_t num_full_pool_rows = get_num_max_m_blocks() * BLOCK_M;
 
@@ -143,12 +162,16 @@ public:
         Buffer<uint32_t> worker_expert_count;
         Buffer<uint32_t> total_expert_count;
         // Completed producer M-blocks; all ones means this rank has finished its stores
+        // 源端按 producer rank 存完成前缀；每条 prefix 独占 sector，避免与其他 rank 的热写互扰。
         Buffer<uint64_t, kL2SectorBytes> combine_ready_prefix;
+        // expert_recv_count 为 [src rank][local expert]，expert_recv_count_sum 为每个本地专家的 packed arrival/sum。
         Buffer<uint32_t> expert_recv_count;
         Buffer<uint32_t, kNumBufferAlignmentBytes> expert_recv_count_sum;
 
         // Packed AIV0 arrivals/M-block count is independent of expert counters
         Buffer<uint32_t> num_m_blocks_certificate;
+        // src_token_metadata 是接收端 route 索引/权重；staged_token_topk_idx 是源端压紧索引 scratch。
+        // 二者都按专家的最坏容量预留，但本次仅 count 前缀有效。
         Buffer<uint64_t> src_token_metadata;
         Buffer<uint32_t> staged_token_topk_idx;
     } metadata{
@@ -174,8 +197,11 @@ public:
 
     // Clear these progress arrays together on each launch
     struct {
+        // 每阶段每逻辑块独立 sector；不同生产核对同一块 atomic_add，不同块不会复用同一计数。
         Buffer<uint32_t, kL2SectorBytes> blocks;
+        // 每 AIC 的已发 GEMM 序号供对应 AIV1 检查；这是 uint8 环绕序号，最终完成仍要等 FIX 事件。
         Buffer<uint8_t, kL2SectorBytes> num_issued_gemms;
+        // 每 AIV0 通知同 block 的 AIV1：certificate 已完整；AIC 通过另一路跨核事件接收通知。
         Buffer<uint8_t, kL2SectorBytes> metadata_ready;
     } progress{
         .blocks = {next_offset, static_cast<uint64_t>(kNumProgressStages) * num_progress_counters_per_stage},
@@ -184,6 +210,8 @@ public:
     };
     const uint64_t num_progress_bytes = next_offset - progress.blocks.offset;
 
+    // 三个独立 payload ring，不互相别名：l1_acts / l2_acts / output。
+    // 分别由 Linear1Ready / Linear2Ready / CombineSent 释放旧槽；元数据仍按全量逻辑行保存。
     struct {
         FP8Buffer l1_acts;
 
@@ -202,6 +230,8 @@ public:
         .output = {next_offset, num_ring_rows * config.hidden, kNumBufferAlignmentBytes},
     };
 
+    // 返回区为全量 [topk-slot][Tmax][hidden]，不随中间激活 ring 回绕。
+    // 共享专家（如有）合并为额外一个槽；源端读取有效 route 并在 FP32 中求和。
     // One BF16 slot per route, plus one combined shared slot
     Buffer<bf16_t> combine_input{
         next_offset, static_cast<uint64_t>(config.num_topk + (config.num_shared_experts > 0)) * config.num_max_tokens_per_rank * config.hidden,
@@ -214,12 +244,16 @@ public:
     Buffer<uint32_t> route_m_blocks{
         next_offset, static_cast<uint64_t>(config.num_max_tokens_per_rank) * config.num_topk, kNumBufferAlignmentBytes};
 
+    // 容量上界：所有 rank 的 route 总量按 M256 向上取整，再为每个本地专家预留额外尾块余量。
     constexpr __aicore__ uint64_t get_num_max_m_blocks() const {
         return ceil_div(static_cast<uint64_t>(config.num_ranks) * config.num_max_tokens_per_rank * config.num_topk, BLOCK_M) + config.num_experts / config.num_ranks;
     }
 
+    // ring 容量按注册上界选择，不随本次专家实际 M 缩小；前瞻深度同时受此容量反压。
     constexpr __aicore__ uint32_t get_num_ring_blocks() const {
         // Measured overlap window; the deadlock-safe minimum can still lose throughput
+        // H/256 是每块 GMM2 N 任务数；任务较少时用 4*32 块扩大在途窗口，否则用 32 块。
+        // 取 min 后若覆盖全 pool 则不回绕；否则 ring 大小为 32 或 128，均为二次幂。
         const uint32_t num_windows = config.hidden / BLOCK_N <= kNumAICores / 2 ? 4 : 1;
         const uint32_t num_window_blocks = num_windows * kNumAICores;
         return get_num_max_m_blocks() < num_window_blocks ? static_cast<uint32_t>(get_num_max_m_blocks()) : num_window_blocks;
@@ -227,11 +261,13 @@ public:
 
     // Coordinates within the registered GM layout
     constexpr __aicore__ __attribute__((always_inline)) uint32_t get_progress_idx(ProgressStage stage, uint32_t progress_slot_idx) const {
+        // 按 [stage][logical progress slot] 展平；绝不取 ring 下标，否则旧代 ready 会误放行新代数据。
         return stage * num_progress_counters_per_stage + progress_slot_idx;
     }
 
     constexpr __aicore__ __attribute__((always_inline)) uint64_t get_src_metadata_idx(
         uint32_t local_expert_idx, uint32_t src_rank_idx, uint32_t src_slot_idx) const {
+        // 按 [local expert][source rank][source slot] 展平，远端发送与本地 dispatch 解码使用同一公式。
         return (static_cast<uint64_t>(local_expert_idx) * config.num_ranks + src_rank_idx) * num_src_slots_per_expert + src_slot_idx;
     }
 
@@ -240,6 +276,7 @@ public:
     }
 
     constexpr __aicore__ __attribute__((always_inline)) uint64_t get_combine_m_idx(uint64_t slot_idx, uint64_t token_idx) const {
+        // combine 行号 = top-k 槽 * 注册 Tmax + 源 token；使用注册容量作 stride，实际 T 变小也不改变地址。
         return slot_idx * config.num_max_tokens_per_rank + token_idx;
     }
 
@@ -257,6 +294,8 @@ inline constexpr Workspace kWorkspace{{
 template <const auto& workspace>
 constexpr __aicore__ uint32_t get_ring_block_idx(uint32_t pool_block_idx) {
     constexpr uint32_t kNumRingBlocks = workspace.get_num_ring_blocks();
+    // 全 pool 模式直接返回逻辑块号；有限 ring 为二次幂，用位与实现取模。
+    // 这里只计算地址，安全覆盖由各阶段对 logical_block - ring_blocks 的完成检查保证。
     return kNumRingBlocks == workspace.get_num_max_m_blocks() ? pool_block_idx : pool_block_idx & (kNumRingBlocks - 1);
 }
 

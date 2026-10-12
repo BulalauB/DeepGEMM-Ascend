@@ -76,6 +76,8 @@ static auto get_symm_buffer_size_for_mega_moe(
     DJ_HOST_ASSERT(mma_type == "fp8xfp4" and activation == "swiglu");
     const auto workspace = get_workspace(num_ranks, num_experts, num_max_tokens_per_rank, num_topk,
                                          hidden, intermediate_hidden, num_shared_experts);
+    // 这些输入视图直接借用已注册的 symmetric allocation；调用方应在 launch 前填好 FP8 data、
+    // scale、top-k ID 和 weight。本 kernel 不包含 BF16 输入量化，计时须明确是否计入输入准备。
     auto slice_input_buffers = [workspace](const torch::Tensor& buffer) {
         DJ_HOST_ASSERT(buffer.nbytes() >= workspace.get_num_bytes());
         const auto& config = workspace.config;

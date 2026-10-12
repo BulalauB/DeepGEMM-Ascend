@@ -109,6 +109,7 @@ private:
         // NOTES: Ranks must match process-wide registration order, including subgroup allocations
         static std::atomic<uint32_t> next_tag_idx = 0;
         const auto memory_tag = "deep_gemm_mega_moe_" + std::to_string(next_tag_idx.fetch_add(1));
+        // HCCL 在 host 侧注册本 rank workspace；所有 rank 用相同标签/注册顺序关联同一 symmetric 区域。
         DG_HCCL_CHECK(HcclCommMemReg(comm, memory_tag.c_str(), &memory, &memory_handle));
 
         peer_ptrs[rank_idx] = reinterpret_cast<uint64_t>(buffer);
@@ -131,6 +132,7 @@ private:
         }
 
         std::vector<ChannelHandle> channels(descriptors.size(), 0);
+        // 申请 AIV 引擎的 peer channel，用于获取远端注册内存映射；kernel 通过 VA 直接读/写 payload。
         DG_HCCL_CHECK(HcclChannelAcquire(
             comm,
             CommEngine::COMM_ENGINE_AIV,
@@ -183,6 +185,7 @@ private:
 
         for (uint32_t link_idx = 0; link_idx < num_links; ++link_idx) {
             const auto& link = links[link_idx];
+            // 只接受 UBMEM 链路；没有该协议时明确失败，不在本实现里回退到 RDMA/AllToAll 数据路径。
             if (link.linkAttr.linkProtocol != COMM_PROTOCOL_UB_MEM)
                 continue;
 

@@ -88,6 +88,9 @@ def _transform_fp8_nz(t: torch.Tensor) -> torch.Tensor:
     return blocks.transpose(-3, -2).contiguous().view(shape).view(t.dtype)
 
 
+# GMM1原始投影为[全部gate,全部up]，这里变成[N-block,gate128|up128,K]。
+# 每个N256任务可独立完成128通道SwiGLU，无需等待另一个task的配对投影。
+# 权重与scale必须同样交错；routed保留packed FP4，shared FP8还需转换到AIC直接读取的NZ。
 def _interleave_weights(t: torch.Tensor) -> torch.Tensor:
     # Gate/up pairs occupy one BLOCK_N block in both weight data and scale factors.
     assert t.dim() in (2, 3)
@@ -126,6 +129,9 @@ def _scale_fp4_weight_sf(sf: torch.Tensor) -> torch.Tensor:
     return exponent.contiguous().view(torch.int16)
 
 
+# 调用前的权重预处理，可在模型加载时复用结果；不在每次融合kernel内重排整个权重。
+# routed FP4由AIV0按tile展开成FP8/64，故此处预先给两个UE8M0指数都加6；
+# shared权重已是FP8，直接排成NZ，不作该补偿。SF最终为[N-block,K-pair,N]。
 def transform_weights_for_mega_moe(
     l1_weights: tuple[torch.Tensor, torch.Tensor],
     l2_weights: tuple[torch.Tensor, torch.Tensor],
@@ -156,6 +162,8 @@ def transform_weights_for_mega_moe(
     return l1_transformed, l2_transformed
 
 
+# 每次调用前需填充sym_buffer.x/x_sf/topk_idx/topk_weights的有效T行；T取y.shape[0]。
+# 接口内不做输入量化或top-k选择，也不重新排权重；这些前处理的耗时应与kernel测量分开。
 def fp8_fp4_mega_moe(y: torch.Tensor,
                      l1_weights: tuple[torch.Tensor, torch.Tensor],
                      l2_weights: tuple[torch.Tensor, torch.Tensor],

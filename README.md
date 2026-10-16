@@ -52,6 +52,8 @@ pip install . --no-build-isolation
 
 Please refer to [DeepGEMM's interfaces](https://github.com/deepseek-ai/DeepGEMM#interfaces) for the kernel APIs.
 
+MegaMoE 的流水、wave 调度、前处理、C/V 同步与 UB/L1/GM 空间分配见[中文设计分析](docs/megamoe_pipeline_design_zh.md)。
+
 > [!NOTE]
 > The scaling factor format on Ascend differs from NVIDIA's: each pair of UE8M0 scaling factors along the K dimension is packed into an `int16`, and the packed values are stored in MN-major order for optimal hardware efficiency.
 

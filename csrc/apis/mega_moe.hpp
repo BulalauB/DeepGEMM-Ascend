@@ -24,6 +24,8 @@ namespace deep_gemm::mega_moe {
 
 namespace py = pybind11;
 
+// Host 与 JIT device 特化共用的布局入口；容量按注册时的最大 token 数，而非当前 y 的行数。
+// 总路由数必须落在低 24 位内，避免计数累加进位到高位的 rank 到达计数。
 static layout::Workspace get_workspace(uint32_t num_ranks, uint32_t num_experts,
                                        uint32_t num_max_tokens_per_rank, uint32_t num_topk,
                                        uint32_t hidden, uint32_t intermediate_hidden, uint32_t num_shared_experts) {
@@ -61,6 +63,8 @@ struct SymmBuffer {
     }
 };
 
+// 构造对称缓冲区的零拷贝视图；from_blob 视图本身不持有根 Tensor 的 HCCL lease。
+// 调用方必须保留 SymmBuffer/根 buffer，直到这些视图参与的异步设备工作完成。
 static torch::Tensor slice_buffer(const torch::Tensor& buffer, uint64_t offset,
                                   torch::IntArrayRef shape, torch::ScalarType dtype) {
     DJ_HOST_ASSERT(buffer.dim() == 1 and buffer.scalar_type() == torch::kInt8 and buffer.is_contiguous());
@@ -125,6 +129,17 @@ static layout::LinearWeights check_weights(const std::tuple<torch::Tensor, torch
     return {static_cast<const uint8_t*>(weights.data_ptr()), static_cast<const int16_t*>(weights_sf.data_ptr())};
 }
 
+// 公开执行入口：校验注册布局、量化权重和输出，再在当前 NPU stream 发起融合 kernel。
+// 输入 token、scale 和 top-k 已由调用方填入 sym_buffer 的对应视图；本函数不再复制输入。
+// num_tokens 取 y 的实际行数，num_max_tokens_per_rank 则继续决定所有 peer 的存储步长。
+// @param y 可写BF16[T,H]输出，T从第0维取得；sym_buffer是注册的int8字节buffer，内含调用方填好的输入。
+// @param l1_weights_tuple/l2_weights_tuple 预排布routed (packed FP4 data,int16 scale pair)。
+// @param shared_l1_weights_tuple_opt/shared_l2_weights_tuple_opt S>0时必填的shared (FP8 NZ,int16 scale pair)。
+// @param cumulative_local_expert_recv_stats 可选int32[E/P]统计输出，累加有效路由行数。
+// @param sym_buffer_ptrs 各rank对称基址列表，rank_idx选本rank；num_max_tokens_per_rank为共同注册容量Tmax。
+// @param num_experts/num_topk/hidden/intermediate_hidden/num_shared_experts 分别为全局E、Ktop、H、I、S。
+// @param recipe 当前要求(1,1,32)；activation要求swiglu，fast_math要求true。
+// @param activation_clamp_opt 可选裁剪界限，未提供则无穷大；量化为BF16精度后传入kernel。
 static void fp8_fp4_mega_moe(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,

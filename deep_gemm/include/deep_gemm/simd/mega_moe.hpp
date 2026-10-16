@@ -9,7 +9,11 @@ namespace deep_gemm::mega_moe {
 
 // FP4 -> FP8 NZ, scaled by 2^-6; weight SFs compensate with +6
 // Rows map to GEMM N; columns map to K
+// 每个int8含两个FP4 nibble，位操作直接构造FP8编码；/64与预排权重SF指数+6配套。
+// 目标NZ用N+1行跨度留padding，UB->L1时跳过这一行；因此UB NZ槽比64KiB多BLOCK_K字节。
 template <uint32_t kNumRows, uint32_t kNumCols>
+// @param src UB packed FP4 [kNumRows,kNumCols/2]；行对应GEMM N，列对应K。
+// @param[out] dst UB FP8 padded NZ，需预留(kNumRows+1)*kNumCols字节；模板维度是逻辑N/K元素数。
 __simd_vf__ inline void vf_fp4_to_fp8_nz(__ubuf__ uint8_t* src, __ubuf__ uint8_t* dst) {
     constexpr uint32_t kNumPackedCols = kNumCols / 2;
     constexpr uint32_t kNumPaddedRows = kNumRows + 1;
@@ -55,7 +59,17 @@ __simd_vf__ inline void vf_fp4_to_fp8_nz(__ubuf__ uint8_t* src, __ubuf__ uint8_t
 }
 
 // Linear1 epilogue: SwiGLU and FP8 quantization
+// 输入每行[gate128,up128] BF16，计算升到FP32；路由分支先对SwiGLU结果乘top-k权重，再量化。
+// 每32通道单独求amax并选2的幂scale，两个UE8M0字节合成int16，64通道对应1个SF pair。
+// 输出FP8行只有128B，原BF16投影行占512B，可从同一UB槽起点原地压紧；
+// 每次先读入完整两行再写较短输出，输出不会覆盖尚未读取的后续投影。
+// SF在UB按[pair,STORE_BLOCK_M]写入，搬GM后保持[M-block,K-pair,256]供GMM2读取。
 template <bool kApplyRouteWeight, uint32_t STORE_BLOCK_M>
+// @param input 当前UB行组的BF16投影，每行gate128/up128；output为FP8[valid_m,128]，可与input共槽。
+// @param[out] output_sf 两列int16 pair，物理[pair,STORE_BLOCK_M]；指针已偏移到本行组首行。
+// @param route_weights 本行组的FP32逐行权重，仅kApplyRouteWeight=true读取，shared可传nullptr。
+// @param valid_m 本次行组有效行数；两行一轮，奇数尾需要调用方保留可读padding行。
+// @param activation_clamp gate上界与up双侧界限；STORE_BLOCK_M是scale列间stride，单位行。
 __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ float8_e4m3_t* output,
                                         __ubuf__ int16_t* output_sf, __ubuf__ float* route_weights,
                                         uint32_t valid_m, float activation_clamp) {
@@ -112,6 +126,7 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
         }
 
         // SwiGLU: gate * up / (1 + exp(-gate))
+        // 路由权重在非线性激活之后、amax/FP8量化之前逐行广播；GMM2消费已加权激活，最终reduce无需再次乘权。
         #pragma unroll
         for (uint32_t pair_idx = 0; pair_idx < kNumPairs; ++ pair_idx) {
             asc_add_scalar(value[pair_idx], value[pair_idx], 1.0f, pair_mask_b32);
@@ -166,6 +181,10 @@ __simd_vf__ inline void vf_swiglu_quant(__ubuf__ bfloat16_t* input, __ubuf__ flo
 }
 
 // Combine: FP32 sum -> BF16; input stride is num_channels
+// 输入是已应用路由权重的BF16专家输出；此处逐有效top-k槽及shared槽做FP32累加，最后一次舍入BF16。
+// 调用方将有效路由压紧到UB，无效expert ID不参与sum；重复expert但不同top-k槽仍分别贡献。
+// @param[in,out] inputs UB中压紧的[num_inputs,num_channels] BF16输入，结果覆盖第0行区域。
+// @param num_inputs 本token有效top-k槽数加可选shared槽；num_channels为当前chunk宽度，须满足向量粒度。
 __simd_vf__ inline void vf_combine_reduce(__ubuf__ bfloat16_t* inputs, uint32_t num_inputs, uint32_t num_channels) {
     constexpr uint32_t kNumChannelsPerVector = sizeof(vector_bfloat16_t) / sizeof(bfloat16_t);
     const auto mask_b16 = asc_create_mask_b16(PAT_ALL);
